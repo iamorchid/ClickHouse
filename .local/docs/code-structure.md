@@ -88,6 +88,103 @@ SQL 文本
 
 ---
 
+### 2.1 SELECT 端到端流转（带 file:line）
+
+下图把上面的分层抽象映射到**具体类和函数**，给出读完一次 SELECT 需要按序定位的关键代码：
+
+```
+客户端 (TCP / HTTP)
+   │
+   ▼
+TCPHandler::runImpl                              src/Server/TCPHandler.cpp:347
+   │  query_state->query_context = createCopy(connection_context)
+   │  executeQuery(query, query_context, ...)
+   ▼
+executeQueryImpl                                 src/Interpreters/executeQuery.cpp:1086
+   │  context->getSettingsRef()                   :1132
+   │  parseQuery(ParserQuery, ...)                :1192
+   │  ProcessList::insert → setProcessListElement :1483-1484
+   │  InterpreterFactory::get(ast, context)       (识别 SELECT)
+   │
+   ▼  AST → QueryTree（语义分析 + 47 个 pass）
+InterpreterSelectQueryAnalyzer::execute          src/Interpreters/InterpreterSelectQueryAnalyzer.cpp:244
+   ├─ buildQueryTree                              src/Analyzer/QueryTreeBuilder.cpp:1286
+   └─ QueryTreePassManager::run                   src/Analyzer/QueryTreePassManager.cpp:266
+        ├─ QueryAnalysisPass                  ← 列名/函数绑定 + 类型推断
+        ├─ FunctionToSubcolumnsPass           ← 子列下推
+        ├─ ConvertQueryToCNFPass              ← 谓词 CNF
+        ├─ CrossToInnerJoinPass               ← JOIN 重写
+        └─ ...（共 47 个 Pass）
+   │
+   ▼  QueryTree → QueryPlan
+Planner::buildQueryPlanIfNeeded                  src/Planner/Planner.cpp:1915
+   ├─ PlannerJoins  → JoinStepLogical / ReadFromMergeTree
+   ├─ PlannerAggregation → AggregatingStep
+   └─ Filter / Sort / Limit / Expression Step
+   │
+   ▼  物理优化（18 个 optimization）
+QueryPlan::optimize                              src/Processors/QueryPlan/QueryPlan.cpp:761
+        ├─ tryPushDownFilter (谓词下推)
+        ├─ tryMergeExpressions / tryMergeFilters
+        ├─ tryConvertOuterJoinToInnerJoin
+        ├─ tryReuseStorageOrderingForWindowFunctions
+        ├─ tryRemoveUnusedColumns / tryOptimizeTopK
+        └─ ...（完整列表见 Optimizations.h:165）
+   │
+   ▼  QueryPlan → QueryPipeline
+QueryPlan::buildQueryPipeline                    src/Processors/QueryPlan/QueryPlan.cpp:218
+   │  后序遍历，每个 step->updatePipeline()
+   │  逻辑步骤 → IProcessor DAG
+   │
+   ▼
+PullingAsyncPipelineExecutor::pull               src/Processors/Executors/PullingAsyncPipelineExecutor
+   └─ PipelineExecutor::execute                  src/Processors/Executors/PipelineExecutor.cpp:138
+         └─ 多线程 IProcessor::prepare() / work()
+              └─ MergeTreeSelectProcessor → ReadBuffer → 列存 I/O
+   │
+   ▼  结果回传
+TCPHandler::sendData                             src/Server/TCPHandler.cpp:2875
+   │  writeVarUInt(Protocol::Server::Data, *out)
+   │  state.block_out->write(block)
+   ▼
+客户端
+```
+
+### 2.2 INSERT 端到端流转
+
+```
+TCPHandler::runImpl                              src/Server/TCPHandler.cpp:347
+   ├─ executeQuery → InterpreterInsertQuery
+   │
+   ▼
+InterpreterInsertQuery::execute                  src/Interpreters/InterpreterInsertQuery.cpp:995
+   └─ buildInsertPipeline                        src/Interpreters/InterpreterInsertQuery.cpp:744
+        ├─ InsertDependenciesBuilder            ← 处理 MV 级联
+        └─ table->write(...) → SinkToStorage
+   │
+   ▼  PushingPipelineExecutor 接收客户端数据块
+MergeTreeSink::consume                           src/Storages/MergeTree/MergeTreeSink.cpp:98
+   ├─ MergeTreeDataWriter::splitBlockIntoParts
+   ├─ MergeTreeDataWriter::writeTempPart        src/Storages/MergeTree/MergeTreeDataWriter.cpp:638
+   │      └─ writeTempPartImpl                  :654
+   │             (写 tmp_insert_xxx/ 目录，列文件 + 索引)
+   ├─ finishDelayedChunk                        (流水线提交)
+   └─ commitPart                                src/Storages/MergeTree/MergeTreeSink.cpp:342
+        ├─ storage.renameTempPartAndAdd        ← Temporary → PreActive
+        └─ transaction.commit(lock)            ← PreActive → Active
+                  └─ MergeTreeData::Transaction::commit  src/Storages/MergeTree/MergeTreeData.cpp:8684
+```
+
+### 2.3 跨层状态传递
+
+| 状态对象 | 创建时机 | 传递方式 |
+|---|---|---|
+| `ContextMutablePtr`（query_context） | `TCPHandler` 从连接 context `createCopy` | 作为参数传入 `executeQuery` → `Interpreter` → `Planner` → `IStorage::read/write` |
+| `Settings` | 通过 `context->getSettingsRef()` 取出（只读） | parser 用 `max_query_size`、analyzer 用 `enable_analyzer`、executor 用 `max_threads` |
+| `ProcessList::Entry` | `executeQueryImpl:1483` | `context->setProcessListElement` → pipeline executor 通过 context 拿 `QueryStatusPtr`，定期检查超时 / 内存 / KILL |
+| `QueryStatus` | 同上 | 进度汇报、取消、内存追踪的入口 |
+| `MemoryTracker` 链 | `ProcessList::insert` 设置 hard_limit | thread → query → user → global 四级嵌套 |
+
 ## 3. `src/` 各目录详细说明
 
 ### 3.1 Layer 0：基础设施
@@ -552,6 +649,333 @@ ClickHouse Keeper：ZooKeeper 兼容的嵌入式协调服务，基于 NuRaft 实
 
 ---
 
+### 3.10 跨层基础设施
+
+下面四个子系统横跨所有 layer，是阅读任何模块前必须先建立认知的「公共词汇表」。
+
+#### `Context` 三层结构
+
+`Context` 是整个 server 的"大脑"，分三层：
+
+```
+ContextSharedPart                      src/Interpreters/Context.cpp:449
+  全局单例，boost::noncopyable
+  ├─ zookeeper / process_list / databases / merge_mutate_executor
+  ├─ schedule_pool / buffer_flush_schedule_pool / macros
+  └─ 锁：ContextSharedMutex mutex / zookeeper_mutex / background_executors_mutex
+
+ContextData                            src/Interpreters/Context.h:351
+  每个 Context 实例私有
+  ├─ shared* → 指向 ContextSharedPart
+  ├─ unique_ptr<Settings>              ← per-query 设置副本
+  ├─ current_database / user_id / current_roles
+  ├─ process_list_elem (weak_ptr<QueryStatus>)
+  └─ query_context / session_context / global_context（weak_ptr 链）
+
+Context : public ContextData, enable_shared_from_this<Context>
+                                       src/Interpreters/Context.h:719
+  指针别名（src/Interpreters/Context_fwd.h:20-22）：
+  using ContextPtr        = shared_ptr<const Context>;
+  using ContextMutablePtr = shared_ptr<Context>;
+  using ContextWeakPtr    = weak_ptr<const Context>;
+```
+
+三层生命周期：
+
+| 层级 | 创建方式 | 持有者 | 字段归属 |
+|---|---|---|---|
+| Global | `createGlobal(shared_part*)` 单例 | Server 主线程 | `ContextSharedPart` 中所有共享资源 |
+| Session | `createCopy(global)` | TCPHandler / HTTPHandler | `ContextData::settings`（已合并 profile） |
+| Query | `createCopy(session)` + `makeQueryContext()` | `executeQuery` | `Settings` 再次覆盖 + 自指 `query_context` |
+
+`createCopy`（`Context.cpp:1332`）加读锁拷贝整个 `ContextData`（含 `Settings`），但 `shared*` 仍复用同一 `ContextSharedPart`——这是 query 之间快速复制设置又共享全局状态的关键。
+
+#### `Settings` 宏体系
+
+```
+LIST_OF_SETTINGS = COMMON_SETTINGS(DECLARE, DECLARE_WITH_ALIAS)
+   ↓ 每项形如 DECLARE(UInt64, max_memory_usage, 0, "...")
+   ↓ 展开为 SettingField<UInt64> max_memory_usage
+   ↓ IMPLEMENT_SETTINGS_TRAITS_CUSTOM_IMPL 生成按名查找表
+                            (src/Core/Settings.cpp:8601)
+```
+
+`Settings` 继承自 `BaseSettings<SettingsTraits>`（`src/Core/BaseSettings.h:143`）。每个字段都是 `SettingField<T>`，自带 `isChanged()` 标记。
+
+设置传播路径：
+
+```
+Client 发送 SET / SQL SETTINGS 子句
+   ↓ TCPHandler 解析为 SettingChange
+   ↓ Context::applySettingsChanges(changes)         Context.h:1141
+   ↓   applySettingsChangesWithLock                  Context.cpp:3142
+   ↓     for each change: setSettingWithLock(name, value, lock)
+   ↓       settings->set(name, value)
+   ↓
+查询执行读取：context.getSettingsRef().max_memory_usage   Context.h:1133
+ProcessList::insert 注入 MemoryTracker:
+   thread_group->memory_tracker.setOrRaiseHardLimit(
+       settings[max_memory_usage])                  ProcessList.cpp:299
+```
+
+#### 线程池族总表
+
+| 名称 | 类型 | 配置项 | 用途 |
+|---|---|---|---|
+| `GlobalThreadPool` | `FreeThreadPool`（`Common/ThreadPool.h:228`） | `max_thread_pool_size` | 通用并发任务（IO、查询） |
+| `merge_mutate_executor` | `MergeTreeBackgroundExecutor<DynamicRuntimeQueue>` | `background_pool_size` | Merge + Mutation |
+| `moves_executor` | `MergeTreeBackgroundExecutor<RoundRobinRuntimeQueue>` | `background_move_pool_size` | Part 跨磁盘迁移 |
+| `fetch_executor` | `OrdinaryBackgroundExecutor` | `background_fetches_pool_size` | Replicated fetch |
+| `common_executor` | `OrdinaryBackgroundExecutor` | `background_common_pool_size` | 其他后台任务 |
+| `schedule_pool` | `BackgroundSchedulePool`（`Core/BackgroundSchedulePool.h:46`） | `background_schedule_pool_size` | Replicated 表定时任务 |
+| `buffer_flush_schedule_pool` | `BackgroundSchedulePool` | — | Buffer 表 flush |
+| `distributed_schedule_pool` | `BackgroundSchedulePool` | — | Distributed send |
+| `message_broker_schedule_pool` | `BackgroundSchedulePool` | — | Kafka / RabbitMQ 消费 |
+
+`ThreadPoolImpl<Thread>`（`Common/ThreadPool.h:37`）是底层模板；`BackgroundSchedulePool` 内部用 `Poco::NotificationQueue`，保证**同一 task 永不并发执行**——这是与普通 `ThreadPoolImpl` 的关键差异。
+
+#### `MemoryTracker` 四级嵌套
+
+```
+total_memory_tracker(nullptr, Global)         MemoryTracker.cpp:147
+  ├── user_memory_tracker(&total, User)       ProcessList.cpp:365
+  │     max_memory_usage_for_user
+  │
+  └── ThreadGroup::memory_tracker(&total, Process)  ProcessList.cpp:299
+        max_memory_usage （per-query）
+        └── thread_local ThreadStatus::memory_tracker(&query, Thread)
+              （每工作线程一个，parent 链向上汇报）
+```
+
+`VariableContext` 枚举（`Common/VariableContext.h`）：`Global=0, User=1, Process=2, Thread=3`，数值越小层级越高。`parent` 是 `std::atomic<MemoryTracker*>`，单向链表向上汇报。
+
+alloc/free 注入点：
+
+```
+new / malloc
+   ↓ Allocator<>::alloc(size)                  Allocator.cpp:76
+   ↓ CurrentMemoryTracker::alloc(size)         CurrentMemoryTracker.h:10
+   ↓ thread_local MemoryTracker::allocImpl     MemoryTracker.cpp:276
+       ├─ 检查 hard_limit
+       │     超出 → throw Exception(MEMORY_LIMIT_EXCEEDED)  :358/452
+       └─ parent->allocImpl 递归                :305
+           （沿 Thread → Process → User → Global 链逐层）
+```
+
+与 jemalloc 协作：jemalloc 仍是真正的分配器，ClickHouse 只在 `alloc`/`free` 前后做统计，不替换分配器。
+
+#### `Block` vs `Chunk` 双轨制
+
+| 维度 | `Block`（`Core/Block.h:30`） | `Chunk`（`Processors/Chunk.h:60`） |
+|---|---|---|
+| 存储 | `vector<ColumnWithTypeAndName>`（含名称+类型+数据） | `Columns` + `UInt64 num_rows` |
+| 语义 | 自描述，含 schema | 轻量级，move-only（拷贝构造 = delete） |
+| 用途 | Parser / Interpreter / 存储 IO / 格式化 | Pipeline Processor 间数据流 |
+| 附加 | `BlockInfo`（is_overflows / bucket_num） | `ChunkInfoCollection`（任意 `ChunkInfo` 子类） |
+
+`Chunk` 不携带 schema 是为了减少 Pipeline 中流转的元数据开销；schema 由各 Processor 的 `OutputPort` 上挂的 `Block header`（静态描述）解释。`Chunk` ↔ `Block` 通过 `convertToChunk` / `header.cloneWithColumns(chunk.getColumns())` 转换。
+
+#### `ZooKeeper` 客户端架构
+
+```
+Coordination::IKeeper                          Common/ZooKeeper/IKeeper.h:761
+  ├── Coordination::ZooKeeper                  ZooKeeperImpl.h:108
+  │     直连 ZooKeeper / ClickHouse Keeper 的真实实现
+  │     send / receive 独立线程 + requests_queue
+  │
+  └── KeeperOverDispatcher                     KeeperOverDispatcher.h:20
+        内嵌 KeeperDispatcher，本节点同时是 Keeper 时绕过网络
+
+zkutil::ZooKeeper                              Common/ZooKeeper/ZooKeeper.h:189
+  业务层包装，持有 unique_ptr<IKeeper> impl
+  ├─ 提供同步接口（异步 + condvar）
+  ├─ 提供 retry 语义（tryMulti / multiNoThrow）
+  └─ 会话管理：startNewSession() 透明重连
+```
+
+`Context::getZooKeeper`（`Context.cpp:5162`）加 `zookeeper_mutex` 懒初始化；若 `expired()` 则 `startNewSession()` 透明返回新 `ZooKeeperPtr`，调用方无需感知重连。
+
+### 3.11 核心接口与类层次
+
+下面七个接口是阅读任何子系统都会反复遇到的"公共抽象层"。把它们的虚函数表记熟，可以让代码阅读速度翻倍。
+
+#### `IColumn` — 列存储接口
+
+```cpp
+// src/Columns/IColumn.h:98（class IColumn 定义）
+class IColumn : public COW<IColumn>
+{
+    virtual MutablePtr clone() const = 0;                              // :107
+    virtual std::string_view getDataAt(size_t n) const = 0;            // :198
+    virtual void insert(const Field & x) = 0;                          // :239
+    virtual void insertRangeFrom(const IColumn & src, size_t, size_t)  // :260
+        = 0;
+    virtual void insertData(const char *, size_t length) = 0;          // :295
+    virtual int  compareAt(size_t n, size_t m, const IColumn & rhs,    // :437
+                           int nan_direction_hint) const = 0;
+};
+```
+
+继承自 `COW<IColumn>`（写时复制）：所有子类通过 `COWHelper<IColumnHelper<Derived>, Derived>` 接入，得到 `Ptr`（不可变共享）与 `MutablePtr`（独占可变）两种智能指针。
+
+```
+IColumn
+├── ColumnFixedSizeHelper
+│   └── ColumnVector<T>             Int/UInt/Float
+├── ColumnString                    变长字节串
+├── ColumnArray                     offsets + nested
+├── ColumnNullable                  null_map + nested
+├── ColumnTuple                     多列并排
+├── ColumnConst                     wrapper：单值 + size
+├── ColumnSparse                    wrapper：values + offsets
+└── ColumnLowCardinality            字典编码
+```
+
+`ColumnConst`/`ColumnSparse` 是 **wrapper**（持有另一 `ColumnPtr` 作 nested），不是叶子。
+
+#### `IDataType` — 数据类型接口
+
+```cpp
+// src/DataTypes/IDataType.h:60
+virtual const char * getFamilyName() const = 0;        // :97
+virtual MutableColumnPtr createColumn() const = 0;     // :159
+virtual Field getDefault() const = 0;                  // :179
+virtual bool  equals(const IDataType & rhs) const = 0; // :198
+virtual bool  isParametric() const = 0;                // :206
+virtual bool  haveSubtypes() const = 0;                // :211
+virtual SerializationPtr doGetSerialization(           // :152
+    const SerializationInfoSettings &) const = 0;      //  protected
+```
+
+`IDataType` 不负责二进制 IO，而是委托给 `ISerialization`（`DataTypes/Serializations/ISerialization.h`）。`DataTypeString` 在稀疏场景下会返回 `SerializationSparse`——这种**类型表示与序列化策略分离**让稀疏/字典编码等优化对上层透明。
+
+类型工厂 `DataTypeFactory`（`DataTypes/DataTypeFactory.h:22`）：`registerDataType(family_name, creator)` 注册，`instance().get("Array(UInt8)")` 触发 AST 解析 + creator 调用。
+
+#### `IFunction` 四层接口
+
+```
+SQL "plus(a, b)"
+   ↓ FunctionFactory::get("plus")
+IFunctionOverloadResolver         src/Functions/IFunction.h:349
+   ↓ build(arguments)             类型推导、Nullable 处理
+IFunctionBase                     src/Functions/IFunction.h:159
+   ↓ prepare(arguments)           可选预计算
+IExecutableFunction               src/Functions/IFunction.h:38
+   ↓ executeImpl(...)
+ColumnPtr 结果
+```
+
+便捷基类 `IFunction`（`:487`）一次实现就被框架自动包装为上述三层对象，是大多数函数的实际入口。
+
+向量化执行约定：
+
+```cpp
+// IFunction.h:500
+virtual ColumnPtr executeImpl(
+    const ColumnsWithTypeAndName & arguments,
+    const DataTypePtr & result_type,
+    size_t input_rows_count) const = 0;
+```
+
+注册：`REGISTER_FUNCTION(Plus)` 宏（`src/Common/register_objects.h:33`）触发静态注册到 `FunctionRegisterMap`，启动时被 `registerFunctions()`（`Functions/registerFunctions.cpp:11`）调用。
+
+#### `IProcessor` 流水线处理器
+
+```cpp
+// src/Processors/IProcessor.h:121
+enum class Status                              // :136
+{
+    NeedData,        // 等待上游输入
+    PortFull,        // 输出端口满
+    Finished,        // 完成
+    Ready,           // 可调 work()
+    Async,           // 异步 IO，使用 schedule() 返回 fd
+    UpdatePipeline,  // 动态修改拓扑
+};
+
+virtual Status prepare(...);   // O(1)，无锁，串行
+virtual void   work();         // CPU 计算，可并行
+```
+
+子类层次：
+
+```
+IProcessor
+├── ISource                    覆写 generate()/tryGenerate()，1 output
+├── ISink                      覆写 consume(Chunk)，1 input
+├── ISimpleTransform           覆写 transform(Chunk &)，1 in/1 out
+└── IAccumulatingTransform     先 consume 全部，再 generate
+```
+
+#### `IStorage` 存储引擎
+
+```cpp
+// src/Storages/IStorage.h
+virtual void read(QueryPlan & query_plan, ...);              // :412 首选
+virtual Pipe read(...);                                       // :389 兼容
+virtual SinkToStoragePtr write(const ASTPtr &, ...);          // :433
+virtual void drop();                                          // :453
+virtual void alter(const AlterCommands &, ...);               // :492
+virtual void mutate(const MutationCommands &, ContextPtr);    // :540
+virtual void startup() / shutdown(bool is_drop = false);      // :562/584
+```
+
+`StorageInMemoryMetadata` 存储 columns / primary key / TTL / indices；通过 `getStorageSnapshot()` 创建不可变快照 `StorageSnapshot` 供查询全程使用。
+
+```
+IStorage
+├── StorageWithCommonVirtualColumns
+├── MergeTreeData                src/Storages/MergeTree/MergeTreeData.h:195
+│   ├── StorageMergeTree         src/Storages/StorageMergeTree.h:35
+│   └── StorageReplicatedMergeTree  src/Storages/StorageReplicatedMergeTree.h:98
+├── StorageDistributed           src/Storages/StorageDistributed.h:45
+└── StorageMerge / StorageView / StorageS3 / ...
+```
+
+#### `IAST` 语法树节点
+
+```cpp
+// src/Parsers/IAST.h:32
+ASTs children;                                    // :35
+virtual ASTPtr clone() const = 0;                  // :148
+virtual void formatImpl(WriteBuffer &, ...) const; // :474
+```
+
+`IAST` 使用侵入式引用计数（`ref_counter`）而非 `shared_ptr`，`flags_storage` 提供位域扩展机制（最高位保留给 `parenthesized`）。
+
+#### `IQueryPlanStep` 与 `IInterpreter`
+
+```cpp
+// src/Processors/QueryPlan/IQueryPlanStep.h:41
+virtual String getName() const = 0;                            // :51
+virtual QueryPipelineBuilderPtr updatePipeline(                // :60
+    QueryPipelineBuilders pipelines,
+    const BuildQueryPipelineSettings & settings) = 0;
+
+// src/Interpreters/IInterpreter.h:15
+virtual BlockIO execute() = 0;                                 // :22
+```
+
+`InterpreterFactory`（`Interpreters/InterpreterFactory.h:15`）按 AST 类型分发到具体 Interpreter。
+
+#### 接口之间的依赖关系
+
+```
+SQL 文本
+   ↓ Parser → IAST
+   ↓ InterpreterFactory → IInterpreter
+   ↓ IInterpreter::execute()
+        ↓ IStorage::read(QueryPlan &)
+            ↓ 追加 IQueryPlanStep（ReadFromXxx）
+                ↓ IQueryPlanStep::updatePipeline()
+                    ↓ 创建 IProcessor（ISource / ITransform）
+                        ↓ IProcessor::work() 消费/产出 Chunk
+                            ↓ Chunk = Columns（IColumn 实现）
+                                ↓ 列类型由 IDataType 描述
+   IFunction::execute() 在 ISimpleTransform 内部被调用
+   IDataType::getSerialization() 在读写路径调用 ISerialization
+```
+
 ## 4. `programs/` 入口点
 
 每个子目录构建一个独立的可执行文件，但最终全部链接为单个 `clickhouse` 多调用二进制（类似 BusyBox）：
@@ -611,6 +1035,120 @@ CMakeLists.txt (根)
 - **IWYU**（Include What You Use）
 - **clang-tidy** 静态分析
 
+### 5.1 源文件注册模式（`dbms_sources` / `dbms_headers`）
+
+`src/CMakeLists.txt` 用两个宏把所有模块的源文件汇集到全局列表：
+
+```cmake
+# cmake/dbms_glob_sources.cmake
+macro(add_headers_and_sources prefix common_path)
+    add_glob(${prefix}_headers ${common_path}/*.h)
+    add_glob(${prefix}_sources ${common_path}/*.cpp ${common_path}/*.c)
+endmacro()
+
+macro(add_glob cur_list)
+    file(GLOB __tmp CONFIGURE_DEPENDS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} ${ARGN})
+    list(APPEND ${cur_list} ${__tmp})
+endmacro()
+
+# src/CMakeLists.txt:310
+macro(add_object_library name common_path)
+    add_headers_and_sources(dbms ${common_path})
+endmacro()
+```
+
+**关键点**：`add_object_library` 不创建独立 CMake target，而是**把源文件追加到全局 `dbms_sources` / `dbms_headers`**，最终统一编译为单一 `dbms` 库。这样跨模块的内联和 LTO 能贯穿整个引擎。
+
+注册示例（`src/CMakeLists.txt:100-340`）：
+
+```cmake
+add_headers_and_sources(clickhouse_common_io Common)
+add_headers_and_sources(clickhouse_common_io IO)
+add_object_library(clickhouse_access       Access)
+add_object_library(clickhouse_datatypes    DataTypes)
+add_object_library(clickhouse_interpreters Interpreters)
+add_object_library(clickhouse_storages     Storages)
+```
+
+主目标链接层次：
+
+```
+clickhouse (programs/CMakeLists.txt)
+    │
+    └─► dbms                              ← 单一大库
+            │
+            └─► clickhouse_common_io      ← 独立静态库（IO/Common/Compression）
+                    │
+                    └─► ch_contrib::*     ← 第三方库
+```
+
+### 5.2 Multitarget 多版本分发
+
+`src/Common/TargetSpecific.h` 提供了同一函数在不同 CPU 特性下生成多份代码、运行时选择最优分支的机制。
+
+```cpp
+// TargetSpecific.h:85-102
+enum class TargetArch : UInt32
+{
+    Default = 0,
+    x86_64_v2      = (1 << 0),  // SSE4.2
+    x86_64_v3      = (1 << 1),  // AVX2
+    x86_64_v4      = (1 << 2),  // AVX-512
+    x86_64_icelake = (1 << 3),
+    GenuineIntel   = (1 << 5),
+};
+
+inline ALWAYS_INLINE bool isArchSupported(TargetArch arch)
+{
+    static UInt32 arches = getSupportedArchs();   // CPUID 静态缓存
+    return arch == TargetArch::Default || (arches & static_cast<UInt32>(arch));
+}
+```
+
+编译时多版本生成宏（`TargetSpecific.h:134-162`）：
+
+```cpp
+#define DECLARE_X86_64_V3_SPECIFIC_CODE(...)                                 \
+BEGIN_X86_64_V3_SPECIFIC_CODE                                                \
+namespace TargetSpecific::x86_64_v3 { __VA_ARGS__ }                          \
+END_TARGET_SPECIFIC_CODE
+```
+
+运行时分发：
+
+```cpp
+if (isArchSupported(TargetArch::x86_64_v4))
+    return TargetSpecific::x86_64_v4::someImpl(args);
+return TargetSpecific::Default::someImpl(args);
+```
+
+典型使用模块：`Columns/ColumnVector.cpp`（向量化排序/过滤）、`Columns/FilterDescription.cpp`、`Compression/CompressionCodecT64.cpp`、`Storages/MergeTree/MergeTreeRangeReader.cpp`、`Common/RadixSort.h`。
+
+### 5.3 Sanitizer / LTO / PGO
+
+`cmake/sanitize.cmake`：
+
+```cmake
+option(SANITIZE "Enable one of the code sanitizers" "")
+# 支持：address (ASan) | memory (MSan) | thread (TSan)
+#       undefined (UBSan) | address,undefined (组合)
+set(SAN_FLAGS "-g -fno-omit-frame-pointer -DSANITIZER")
+```
+
+MSan 在 `x86-64-v3` 及以上构建会启用 `track-origins=1` 并加 `-mno-vzeroupper`（避免 AVX/MSan 交互导致性能问题）。
+
+ThinLTO（`CMakeLists.txt:387-403`）：
+
+```cmake
+option(ENABLE_THINLTO "Clang-specific link time optimization" OFF)
+if (ENABLE_THINLTO AND NOT ENABLE_TESTS AND NOT SANITIZE)
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "... -flto=thin -fwhole-program-vtables")
+    # 使用 lld 时额外加 --lto-whole-program-visibility
+endif()
+```
+
+PGO / BOLT（`cmake/profile_optimization.cmake`）：插桩构建 → 用真实工作负载收集 profile → 用 `CLICKHOUSE_PGO_PROFILE_PATH` 提供 `.profdata` 重新编译；`ENABLE_CLICKHOUSE_BOLT` 启用 BOLT 二进制重排（`--emit-relocs`）。
+
 ---
 
 ## 6. 测试组织
@@ -635,9 +1173,134 @@ CMakeLists.txt (根)
 
 许多 `src/*/` 目录包含自己的 `tests/` 子目录，存放 C++ 单元测试（基于 Google Test，来自 `contrib/googletest`）。
 
+### 6.1 `0_stateless` 测试约定
+
+每个测试由两个文件组成：
+
+```
+NNNNN_test_name.sql        # 或 .sh / .py / .expect
+NNNNN_test_name.reference  # 期望输出（空文件 = 无输出）
+```
+
+文件首行支持 **Tags 注释**（由 `tests/clickhouse-test:3806` 解析）：
+
+```sql
+-- Tags: no-parallel, no-fasttest, zookeeper
+-- Tags: distributed, no-asan, no-tsan, long
+```
+
+常见 tag：`no-parallel`（禁止并行）、`no-fasttest`（跳过快速测试）、`distributed`（需要分布式）、`zookeeper`（需要 ZooKeeper）、`long`（超时延长）。
+
+### 6.2 `add-test` 工具
+
+新增一个测试用 `tests/queries/0_stateless/add-test`，它自动分配下一个可用编号并创建 SQL + reference 两个文件：
+
+```bash
+./tests/queries/0_stateless/add-test my_feature
+# 创建 22802_my_feature.sql 和 22802_my_feature.reference
+
+./tests/queries/0_stateless/add-test my_feature.sh
+# 创建 22802_my_feature.sh（含标准头部）和 .reference
+```
+
+脚本逻辑：扫描目录中最大编号，+1 补零到 5 位，按模板写文件。
+
+### 6.3 集成测试运行方式
+
+```bash
+# 本地执行（与 CI 相同的 Docker 编排）
+python -m ci.praktika run "integration" --test test_named_collections
+python -m ci.praktika run "Integration tests (amd_asan, 1/5)" --test test_kafka
+```
+
+每个测试是一个 pytest 目录（`tests/integration/test_*/test.py`），由 `conftest.py` + `helpers/cluster.py` 封装 ClickHouse 实例的 Docker 启动/停止。Kafka、S3、PostgreSQL 等外部依赖以 sidecar container 提供。
+
+### 6.4 单元测试自动发现
+
+`src/CMakeLists.txt:874-880` 通过递归 glob 收集所有 `gtest_*.cpp`：
+
+```cmake
+macro(grep_gtest_sources BASE_DIR DST_VAR)
+    file(GLOB_RECURSE "${DST_VAR}" CONFIGURE_DEPENDS RELATIVE "${BASE_DIR}" "gtest*.cpp")
+endmacro()
+grep_gtest_sources("${ClickHouse_SOURCE_DIR}/src" dbms_gtest_sources)
+clickhouse_add_executable(unit_tests_dbms ${dbms_gtest_sources})
+```
+
+`src/` 任意位置的 `gtest_*.cpp` 都会被自动纳入 `unit_tests_dbms`。运行：
+
+```bash
+./build/src/unit_tests_dbms --gtest_filter='*MergeTree*'
+```
+
 ---
 
-## 7. `contrib/` 第三方库（263 个）
+## 7. 代码导航快速索引
+
+下表把常见"想找 X 的实现"问题映射到入口符号和文件位置，是日常阅读代码最快的"传送门"。
+
+| 找什么 | 入口符号 | 文件位置 |
+|---|---|---|
+| 一个 SQL 函数（如 `plus`） | `REGISTER_FUNCTION(Foo)` 宏 | `src/Functions/FunctionFoo.cpp` |
+| 函数注册汇总（启动时被调） | `registerFunctions()` | `src/Functions/registerFunctions.cpp:11` |
+| 函数工厂 | `FunctionFactory::instance()` | `src/Functions/FunctionFactory.h` |
+| 一个表引擎 | `registerStorageFoo(StorageFactory &)` | 声明 `src/Storages/registerStorages.cpp`；实现 `src/Storages/StorageFoo.cpp` |
+| 一个数据类型 | `registerDataTypeFoo(DataTypeFactory &)` | `src/DataTypes/DataTypeFactory.h:80+` + `src/DataTypes/DataTypeFoo.cpp` |
+| 一个查询 setting | `IMPLEMENT_SETTINGS_TRAITS` 展开点 | `src/Core/Settings.cpp:8601` |
+| 一个 server setting | `IMPLEMENT_SETTINGS_TRAITS_WITH_PATH_CUSTOM_IMPL` | `src/Core/ServerSettings.cpp:1715` |
+| 一个 format setting | `IMPLEMENT_SETTINGS_TRAITS` | `src/Core/FormatFactorySettings.cpp:39` |
+| 一个 `system.*` 表 | `attachSystemTablesServer / attach<StorageSystemFoo>()` | `src/Storages/System/attachSystemTables.cpp:156` |
+| 一个 Interpreter（DDL） | `InterpreterFactory::registerInterpreter` | `src/Interpreters/InterpreterFactory.cpp` |
+| 一个 Aggregate Function | `AggregateFunctionFactory::registerFunction` | `src/AggregateFunctions/AggregateFunctionFactory.h` |
+| 一个 Table Function | `TableFunctionFactory::registerFunction` | `src/TableFunctions/TableFunctionFactory.h` |
+| 一个 QueryPlan 优化 | `Optimizations` 数组 | `src/Processors/QueryPlan/Optimizations/Optimizations.h:165` |
+| 一个 Analyzer Pass | `addQueryTreePasses` | `src/Analyzer/QueryTreePassManager.cpp:266` |
+| ClickHouse Keeper RAFT 入口 | `KeeperServer` + NuRaft | `src/Coordination/KeeperServer.{h,cpp}` |
+| MergeTree 后台任务 | `BackgroundJobsAssignee` | `src/Storages/MergeTree/BackgroundJobsAssignee.{h,cpp}` |
+
+### 函数注册的完整链路
+
+```
+REGISTER_FUNCTION(Foo)                          src/Functions/FunctionFoo.cpp
+   │  （宏定义：src/Common/register_objects.h:33）
+   │  （静态初始化时注册到全局 map）
+   ▼
+FunctionRegisterMap::instance()                 src/Common/register_objects.h:13
+   │  （进程启动时被调用）
+   ▼
+registerFunctions()                             src/Functions/registerFunctions.cpp:11
+   │  （遍历 map，依次调用各 register 函数）
+   ▼
+FunctionFactory::instance().registerFunction<FunctionFoo>(...)
+                                                src/Functions/FunctionFactory.h
+```
+
+类似地，DataType / Storage / Aggregate / TableFunction 等都遵循「`REGISTER_xxx` 宏 → 静态注册 → 全局 `registerXxx()` 汇总 → 工厂 `registerXxx()`」的模式，记住一个模式就掌握全部。
+
+### 「我想看 SELECT 怎么执行」最短路径
+
+```
+1. src/Server/TCPHandler.cpp:347       ← runImpl
+2. src/Interpreters/executeQuery.cpp:1086  ← executeQueryImpl（核心调度）
+3. src/Interpreters/InterpreterSelectQueryAnalyzer.cpp:244  ← analyzer 入口
+4. src/Planner/Planner.cpp:1915        ← buildQueryPlanIfNeeded
+5. src/Processors/QueryPlan/QueryPlan.cpp:218  ← buildQueryPipeline
+6. src/Processors/Executors/PipelineExecutor.cpp:138  ← execute
+```
+
+### 「我想看 INSERT 怎么落盘」最短路径
+
+```
+1. src/Interpreters/InterpreterInsertQuery.cpp:995   ← execute → buildInsertPipeline
+2. src/Storages/MergeTree/MergeTreeSink.cpp:98       ← consume
+3. src/Storages/MergeTree/MergeTreeDataWriter.cpp:654 ← writeTempPartImpl
+4. src/Storages/MergeTree/MergeTreeSink.cpp:342      ← commitPart
+5. src/Storages/MergeTree/MergeTreeData.cpp:8684     ← Transaction::commit
+```
+
+---
+
+## 8. `contrib/` 第三方库（263 个）
 
 按类别分组的关键库：
 
@@ -665,7 +1328,7 @@ CMakeLists.txt (根)
 
 ---
 
-## 8. 架构总结
+## 9. 架构总结
 
 ClickHouse 是一个**分层列式数据库**，架构特点：
 

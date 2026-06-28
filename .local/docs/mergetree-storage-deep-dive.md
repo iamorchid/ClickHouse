@@ -673,6 +673,62 @@ granule 是“行范围”，mark 是“文件位置”，压缩块是“解压 
 | 一个压缩块包含多个 granule 片段 | 可能 | granule 较小或压缩块 flush 较晚时会出现 |
 | granule 边界总是压缩块边界 | 不保证 | 只有写入时刚好 flush 才会重合 |
 
+#### 多主键列时 mark 指向哪个 `.bin`
+
+容易混淆的一点是：主键索引 `primary.idx` 把多列 PK 的值平铺在一起（每个 mark 一组 `[col0, col1, ..., colN]`），那一个 mark 是不是只对应"某一个主键列"的文件位置？
+
+答案是 **mark 不是按 PK 列归属的**。`primary.idx` 不存任何文件偏移，它只存主键值；真正描述"文件位置"的是每个**列子流**自己的 `.mrk2`，每个 `.bin` / 子流都有一份独立的 `.mrk2`。mark N 是一个**逻辑 granule 序号**，所有列、所有子流的"mark N"指代同一段行（约 `index_granularity` 行），但每个子流的"mark N"分别指向自己 `.bin` 内的物理位置。
+
+以 `ORDER BY (tenant_id, ts)` + 表里再有非 PK 列 `payload Array(String)` 为例，Wide `Part` 的实际布局：
+
+```
+Part 目录
+├── primary.idx                       ← 只存值: 每 mark 一行 (tenant_id, ts)
+│       mark 0: [tenant_id=1,  ts=100]
+│       mark 1: [tenant_id=1,  ts=200]
+│       mark 2: [tenant_id=2,  ts=50 ]
+│       （这里没有任何文件偏移）
+│
+├── tenant_id.bin   ── tenant_id.mrk2          ← 主键列 1 的数据文件 + marks
+├── ts.bin          ── ts.mrk2                 ← 主键列 2 的数据文件 + marks
+├── payload.size0.bin ── payload.size0.mrk2    ← 非 PK 列 Array 子流（offsets）
+├── payload.bin     ── payload.mrk2            ← 非 PK 列 Array 子流（elements）
+└── ...
+
+  mark 1 的"文件位置"是 4 个：
+    tenant_id.mrk2 [1]       → tenant_id.bin   内的 (offset_in_compressed, offset_in_decompressed)
+    ts.mrk2 [1]              → ts.bin          内的位置
+    payload.size0.mrk2 [1]   → payload.size0.bin 内的位置
+    payload.mrk2 [1]         → payload.bin     内的位置
+
+  这四个"mark 1"指向**同一段行**（granule 1），但**各自指向自己的 .bin**。
+```
+
+关键事实：
+
+- **`primary.idx` 不含任何 mark/offset/字节位置**，只把每个 mark 起点的 PK 值平铺写入（见上文 3.1 节磁盘格式）。它的作用是给 `KeyCondition` 提供"按 mark 二分"的内存数组，让裁剪算出 `[from_mark, to_mark)` 区间。
+- **每个列子流（包括 PK 列、非 PK 列、Array offsets、Nullable null map、LowCardinality dictionary 等所有子流）都有自己的 `.mrk2`**；mark N 在每份 `.mrk2` 中各占一条记录（24 字节：`offset_in_compressed_file` + `offset_in_decompressed_block` + `rows_in_granule`）。
+- 主键由多列组成时，**PK 列之间是独立的列子流**，例如 `tenant_id.bin` 与 `ts.bin` 是各自压缩的两个文件，互不重叠；mark N 在 `tenant_id.mrk2` 里指向 `tenant_id.bin`，在 `ts.mrk2` 里指向 `ts.bin`，二者的 `offset_in_compressed_file` 数值通常完全不同。
+- **查询的读列集合 = SELECT 列 ∪ WHERE/PREWHERE 引用列**。例如 `SELECT payload WHERE tenant_id = 1 AND ts BETWEEN 100 AND 200`：
+  1. `KeyCondition` 在 `primary.idx` 的内存数组上二分得到**候选** mark range `[from, to)`——这是"可能包含命中行"的 granule 范围，**不是精确行集合**：边界 granule 内通常只有一部分行真正满足条件（mark M 起点 PK 值落在区间外、但 mark M 内某些行落在区间内是常见情况）。
+  2. 因此读取器必须把过滤列也读进来做行级 `WHERE`：`tenant_id.bin` / `ts.bin` **会被打开**，各自走自己的 `.mrk2` seek，反序列化候选 mark range 的行，再用 `tenant_id = 1 AND ts BETWEEN 100 AND 200` 逐行过滤。
+  3. PREWHERE（无论用户显式写 `PREWHERE` 还是被 `move_primary_key_columns_to_end_of_prewhere` 等优化自动搬运）会把这些过滤列**先**读：先扫 `tenant_id.bin` / `ts.bin` 算出存活行掩码，再用掩码去读 `payload.size0.bin` / `payload.bin`，让 `payload` 只读存活行覆盖的压缩块，省掉被过滤掉行的反序列化。
+  4. **没被引用的列才完全不打开**。例如表里另有 `debug_blob` 列、查询既不 SELECT 也不 WHERE 它，那它的 `.bin` 在整次 SELECT 中不会被 seek。
+
+  也就是说，PK 列被引用在 `WHERE` 时仍要走列读路径——`primary.idx` 只负责把 granule 集合从全表收敛到候选，行级精确过滤还是要回到对应列的 `.bin`。唯一能让 PK 过滤列免读的特殊情形是：`KeyCondition::alwaysUnknownOrTrue` 能证明候选 range 的**所有** granule 在该谓词上都恒为真（条件已被 PK 完全包含、且不在 range 边界处出现"部分匹配"），代码层面对应 `MergeTreeRangeReader` 跳过对应过滤步骤——但这条捷径很苛刻，不能作为一般规律。
+- Compact `Part` 没有这种"每子流一文件"的展开。它只有一份 `data.mrk3` / `data.mrk4`，每条 mark 是一个**偏移数组**：每列（或每子流）一对 `(offset_in_compressed, offset_in_decompressed)`，再加一个 `rows_in_granule`。例如多主键 `(tenant_id, ts)` + `payload` 在 Compact 下，mark 1 形如：
+
+  ```
+  mark 1 in data.mrk3:
+    [ tenant_id pos ][ ts pos ][ payload pos ][ rows_in_granule ]
+                                                      ↑
+        每列/子流一组 (offset_in_compressed, offset_in_decompressed)
+  ```
+
+  此时 mark 仍然不归属任何单一 PK 列，它把整 granule 内所有列的位置一次性记录下来，读取时按需取用对应列的 pair。
+
+一句话总结：**主键是按值排序行的依据，决定 mark 的行边界；mark 的"文件位置"则是逐列子流分别存在各自 `.mrk2` 里的，与 PK 列数无关，也不存在"mark 属于某个 PK 列"这种说法。**
+
 #### 压缩块何时 flush
 
 写入列数据时，数据先进入 `CompressedWriteBuffer` 的未压缩缓冲区。flush 的本质是调用 `CompressedWriteBuffer::next`：把当前缓冲区里的未压缩 bytes 压缩成一个压缩块，写入 `.bin` 或 `data.bin`，然后清空缓冲区继续写。
