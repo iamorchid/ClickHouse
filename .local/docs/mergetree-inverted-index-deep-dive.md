@@ -1055,18 +1055,76 @@ __text_index_<index_name>_<function_name>_<hash> UInt8
 对于：
 
 ```sql
-SELECT count()
+SELECT author, title
 FROM docs
-WHERE hasToken(body, 'clickhouse');
+WHERE publish_date > '2000-12-31'
+  AND hasToken(body, 'clickhouse');
 ```
 
-计划可以把 `hasToken(body, 'clickhouse')` 替换为虚拟列：
+假设 `docs` 表上有：
+
+```sql
+INDEX body_text body TYPE text(tokenizer = splitByNonAlpha)
+```
+
+这个查询里有两类过滤条件：
+
+1. `publish_date > '2000-12-31'`：普通列过滤，需要读取 `publish_date`，或者由主键、minmax、其他 skip index 先裁剪 mark range。
+2. `hasToken(body, 'clickhouse')`：text index 支持的精确 token 谓词，可以用 direct read 生成虚拟过滤列。
+
+优化后的逻辑可以理解为：
 
 ```text
-WHERE __text_index_body_text_hasToken_<hash>
+原始谓词:
+publish_date > '2000-12-31'
+AND hasToken(body, 'clickhouse')
+
+改写后:
+publish_date > '2000-12-31'
+AND __text_index_body_text_hasToken_<hash>
 ```
 
-读取某个 mark 时：
+因为 `hasToken` 对 text index 是 `Exact` direct read，虚拟列命中就等价于原始 `hasToken(body, 'clickhouse')` 命中。执行时不需要为了这个谓词读取 `body` 列，也不需要对每行重新 tokenize 和执行 `hasToken` 函数。
+
+一次查询在单个 `Part` 内大致分成几步：
+
+```text
+1. 分析谓词
+   hasToken(body, 'clickhouse')
+      -> TextSearchQuery(function = hasToken, mode = All, direct = Exact, tokens = ['clickhouse'])
+      -> 虚拟列名 __text_index_body_text_hasToken_<hash>
+
+2. 读取 text index header
+   skp_idx_body_text.idx
+      -> sparse index
+      -> 定位 'clickhouse' 所在 dictionary block
+
+3. 读取 dictionary block
+   skp_idx_body_text.dct.idx
+      -> 找到 token 'clickhouse'
+      -> 得到 TokenPostingsInfo
+         cardinality = ...
+         offsets = posting blocks 在 .pst.idx 中的位置
+         ranges  = 每个 posting block 覆盖的 row id 范围
+
+4. 读取需要的 posting blocks
+   skp_idx_body_text.pst.idx
+      -> 解出 postings('clickhouse')
+      -> 这是 Part 内 row id 集合，例如 {0, 2, 100, 8193, ...}
+
+5. 按 mark 生成虚拟 UInt8 列
+   当前 mark rows [8192, 16383]
+   postings('clickhouse') ∩ [8192, 16383] = {8193, 9000}
+      -> 虚拟列在 mark 内对应行填 1
+      -> 其他行填 0
+
+6. 继续执行普通表达式过滤和投影
+   读取 publish_date 判断 publish_date > '2000-12-31'
+   对两个过滤条件做 AND
+   对保留下来的行读取或输出 author、title
+```
+
+第 5 步对应 `MergeTreeReaderTextIndex::readRows`。它按 mark range 生成虚拟列：
 
 ```text
 mark -> rows [mark_start, mark_end]
@@ -1078,7 +1136,15 @@ virtual column for this mark:
   ...
 ```
 
-这样可以避免读取原始 `body` 列并执行字符串函数。对精确 token 函数，例如 `hasToken`、`hasAnyTokens`、`hasAllTokens`，direct read 可以是 `Exact`。对 `like`、`startsWith`、`endsWith`、某些 preprocessor 或 tokenizer 场景，direct read 可能只能作为 `Hint`：虚拟列先减少候选行，原始谓词仍要执行以保证正确性。
+这里要注意两个边界：
+
+- `body` 列不是投影列，也不再需要参与 `hasToken` 原谓词计算，所以这条路径可以避免读取 `body`；
+- `publish_date` 仍然是普通过滤列，除非被主键或其他索引完全裁剪，否则还要读取并执行比较；
+- `author`、`title` 是输出列，最终命中的行仍然需要读取它们。
+
+如果当前 mark 的 postings 与 mark row range 没有交集，虚拟列全是 `0`，这一段数据会被过滤掉。若有交集，也只把命中的 row id 位置置为 `1`，后续再和 `publish_date` 条件一起过滤。
+
+对精确 token 函数，例如 `hasToken`、`hasAnyTokens`、`hasAllTokens`，direct read 可以是 `Exact`。对 `like`、`startsWith`、`endsWith`、`hasPhrase`、某些 preprocessor 或 tokenizer 场景，direct read 可能只能作为 `Hint`：虚拟列先减少候选行，原始谓词仍要执行以保证正确性。
 
 ### 9.3 Pattern 查询
 
